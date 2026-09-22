@@ -27,6 +27,9 @@ Both readers need Python 3 and nothing outside its standard library, except
 that `read_venues.py` shells out to the `zstd` command line tool. Each prints
 counts by default and every row with `--list`.
 
+`songs-<date>` is not part of the ODbL offer: it is the song fingerprint pack
+Snug's build fetches, and its release notes say what it holds.
+
 `index-2026-08-19` is an older, combined file from before the two databases
 were split, superseded by the per-database releases and kept only so a link to
 it still works.
