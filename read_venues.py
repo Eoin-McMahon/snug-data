@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Reports what is in a built venue database, as counts and nothing else.
+"""Reads Snug's venue database: counts and structure by default, rows on
+request.
 
-The offer under ODbL 4.6b needs a README saying what the published file holds,
-and the numbers in it have to come from the file rather than from memory. This
-walks the venue database and prints counts.
+This is the reader that ships with the venue database in the ODbL offer at
+github.com/Eoin-McMahon/snug-data, beside `read_tunes.py` for the tune index.
+A recipient runs it to check the download and to get every venue back out:
 
-It prints no text out of the file, ever. The venue database holds no thesession
-material, but `holds_sessions` is set by matching against thesession's session
-listings (`snug-cli venue-listings`), and this script's whole reason for
-existing is to be trusted with material under that licence without needing a
-human to re-check it every run. So the rule that nothing but a count leaves
-this script stays exactly as it was when the file held both databases: every
-field that holds a name, a street, a locality or a website is measured and
-stepped over. See CLAUDE.md.
+    python3 read_venues.py venues.vpack            counts and structure
+    python3 read_venues.py venues.vpack --json     the same, machine readable
+    python3 read_venues.py venues.vpack --list     one tab separated row per venue
 
-    python3 scripts/measure/idx_summary.py data/index/venues.vpack
-    python3 scripts/measure/idx_summary.py data/index/venues.vpack --json
+The counts mode prints no text out of the file, only numbers. The rows are
+OpenStreetMap places and one yes or no per venue for whether thesession.org
+lists a session there; no text from thesession's dump is in the file.
 
 Reads either of the two formats `crates/snug-corpus` writes, chosen by the
 file's own magic bytes:
@@ -39,12 +36,8 @@ file's own magic bytes:
 Both are version locked: meeting an unknown version stops rather than
 guesses, because a misparse here reports confident nonsense.
 
-Core 813, ADR-0018: the venue database left the tune index for its own
-artifact (magic `TRDV`). Core 810 repointed this script at that file, since the
-ODbL offer covers the venue database and never covered the tune corpus this
-script used to walk. Core 823 made the phone read `venue_pack` instead, and
-core 829 is what taught this script the format the app and the offer actually
-carry.
+Split from `idx_summary.py` by core 1048, when the offer began publishing the
+tune index too, each database with its own reader.
 """
 
 from __future__ import annotations
@@ -293,31 +286,72 @@ def walk_record_blocks(raw: bytes, block_boundaries: list[int]) -> int:
     return with_street
 
 
-def walk_trvp(blob: bytes) -> dict[str, int]:
+def trvp_header(blob: bytes) -> dict:
+    """The fixed header, in the order `venue_pack.rs` writes it."""
     if len(blob) < TRVP_HEADER_LEN or blob[:4] != TRVP_MAGIC:
         raise SystemExit("not a snug venue pack")
     cursor = Cursor(blob)
     cursor.skip(4)
-    version = cursor.u32()
-    if version != TRVP_VERSION:
-        raise SystemExit(f"venue pack is version {version}, this script reads {TRVP_VERSION}")
-    venue_count = cursor.u32()
-    block_len = cursor.u32()
-    block_count = cursor.u32()
-    string_table_offset = cursor.u64()
-    string_table_clen = cursor.u32()
-    string_table_rawlen = cursor.u32()
-    website_block_index_offset = cursor.u64()
-    block_index_offset = cursor.u64()
-    side = {}
+    header = {"version": cursor.u32()}
+    if header["version"] != TRVP_VERSION:
+        raise SystemExit(
+            f"venue pack is version {header['version']}, this script reads {TRVP_VERSION}"
+        )
+    for name, read in (
+        ("venue_count", cursor.u32),
+        ("block_len", cursor.u32),
+        ("block_count", cursor.u32),
+        ("string_table_offset", cursor.u64),
+        ("string_table_clen", cursor.u32),
+        ("string_table_rawlen", cursor.u32),
+        ("website_block_index_offset", cursor.u64),
+        ("block_index_offset", cursor.u64),
+    ):
+        header[name] = read()
+    header["side"] = {}
     for name in ("grams", "ids", "grid", "listed", "keys", "priors"):
-        side[name] = (cursor.u64(), cursor.u32())
-    dictionary_offset = cursor.u64()
-    dictionary_len = cursor.u32()
-    website_dictionary_offset = cursor.u64()
-    website_dictionary_len = cursor.u32()
+        header["side"][name] = (cursor.u64(), cursor.u32())
+    for name, read in (
+        ("dictionary_offset", cursor.u64),
+        ("dictionary_len", cursor.u32),
+        ("website_dictionary_offset", cursor.u64),
+        ("website_dictionary_len", cursor.u32),
+    ):
+        header[name] = read()
     if cursor.at != TRVP_HEADER_LEN:
         raise SystemExit("the fixed header did not add up to its own declared length")
+    return header
+
+
+def trvp_blocks(blob: bytes, header: dict) -> list[tuple[int, int, int]]:
+    """Each record block's offset, compressed length and raw length."""
+    entries = []
+    at = header["block_index_offset"]
+    for _ in range(header["block_count"]):
+        # first_morton (u8; 8), offset (u8; 8), compressed_len (u32), raw_len (u32)
+        _first_morton, offset, compressed_len, raw_len = struct.unpack_from("<QQII", blob, at)
+        entries.append((offset, compressed_len, raw_len))
+        at += 24
+    if not entries:
+        raise SystemExit("a venue pack with no record blocks")
+    return entries
+
+
+def walk_trvp(blob: bytes) -> dict[str, int]:
+    header = trvp_header(blob)
+    version = header["version"]
+    venue_count = header["venue_count"]
+    block_len = header["block_len"]
+    block_count = header["block_count"]
+    string_table_offset = header["string_table_offset"]
+    string_table_clen = header["string_table_clen"]
+    string_table_rawlen = header["string_table_rawlen"]
+    website_block_index_offset = header["website_block_index_offset"]
+    side = header["side"]
+    dictionary_offset = header["dictionary_offset"]
+    dictionary_len = header["dictionary_len"]
+    website_dictionary_offset = header["website_dictionary_offset"]
+    website_dictionary_len = header["website_dictionary_len"]
 
     dictionary_path = None
     if dictionary_len:
@@ -357,17 +391,7 @@ def walk_trvp(blob: bytes) -> dict[str, int]:
                 raise SystemExit("a website group decompressed to an unexpected length")
             with_website += walk_website_block(raw)
 
-        entries = []
-        at = block_index_offset
-        for _ in range(block_count):
-            # first_morton (u8; 8), offset (u8; 8), compressed_len (u32), raw_len (u32)
-            first_morton, offset, compressed_len, raw_len = struct.unpack_from(
-                "<QQII", blob, at
-            )
-            entries.append((offset, compressed_len, raw_len))
-            at += 24
-        if not entries:
-            raise SystemExit("a venue pack with no record blocks")
+        entries = trvp_blocks(blob, header)
         first_block_offset = entries[0][0]
         blocks_span = sum(entry[1] for entry in entries)
         block_bytes = blob[first_block_offset : first_block_offset + blocks_span]
@@ -396,6 +420,140 @@ def walk_trvp(blob: bytes) -> dict[str, int]:
     }
 
 
+VENUE_KINDS = [
+    "pub",
+    "bar",
+    "restaurant",
+    "cafe",
+    "community centre",
+    "arts centre",
+    "social centre",
+    "hotel",
+]
+ORIGINS = {0: "n", 1: "w", 2: "r"}
+
+
+def clean(text: str) -> str:
+    """One field of a tab separated row: tabs and newlines would split it."""
+    return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+
+
+def varint_string(raw: bytes, cursor: Cursor) -> str:
+    length = cursor.varint()
+    start = cursor.at
+    cursor.skip(length)
+    return raw[start : start + length].decode("utf-8")
+
+
+def list_trvp(blob: bytes, out) -> None:
+    """Every venue as one tab separated row, in the pack's own row order.
+
+    Decodes what `walk_trvp` steps over: the string table, each record's
+    coordinate deltas and prefix-shared name, the website groups and the
+    listed rows. Coordinates are stored as degrees times ten million.
+    """
+    header = trvp_header(blob)
+    block_len = header["block_len"]
+
+    offset = header["string_table_offset"]
+    _, string_raw = walk_string_table(blob[offset : offset + header["string_table_clen"]])
+    strings = []
+    cursor = Cursor(string_raw)
+    while cursor.at < len(string_raw):
+        strings.append(varint_string(string_raw, cursor))
+
+    websites: dict[int, str] = {}
+    website_dictionary_path = None
+    if header["website_dictionary_len"]:
+        start = header["website_dictionary_offset"]
+        website_dictionary_path = spill(blob[start : start + header["website_dictionary_len"]])
+    try:
+        for group in range(-(-header["block_count"] // WEBSITE_BLOCK_GROUP)):
+            at = header["website_block_index_offset"] + group * 16
+            start, compressed_len, _ = struct.unpack_from("<QII", blob, at)
+            if not compressed_len:
+                continue
+            raw = zstd_decompress(blob[start : start + compressed_len], website_dictionary_path)
+            first_row = group * WEBSITE_BLOCK_GROUP * block_len
+            cursor = Cursor(raw)
+            row = 0
+            while cursor.at < len(raw):
+                row += cursor.varint()
+                websites[first_row + row] = varint_string(raw, cursor)
+    finally:
+        if website_dictionary_path is not None:
+            website_dictionary_path.unlink(missing_ok=True)
+
+    listed_offset, listed_len = header["side"]["listed"]
+    listed = {
+        value for (value,) in U32.iter_unpack(blob[listed_offset : listed_offset + listed_len])
+    }
+
+    entries = trvp_blocks(blob, header)
+    dictionary_path = None
+    if header["dictionary_len"]:
+        start = header["dictionary_offset"]
+        dictionary_path = spill(blob[start : start + header["dictionary_len"]])
+    try:
+        first = entries[0][0]
+        span = sum(entry[1] for entry in entries)
+        records = zstd_decompress(blob[first : first + span], dictionary_path)
+    finally:
+        if dictionary_path is not None:
+            dictionary_path.unlink(missing_ok=True)
+
+    out.write(
+        "row\tosm_id\tkind\tlatitude\tlongitude\tname\tstreet\tlocality\tarea\t"
+        "country\tholds_sessions\twebsite\n"
+    )
+    cursor = Cursor(records)
+    row = 0
+    for block, (_, _, raw_len) in enumerate(entries):
+        end = cursor.at + raw_len
+        row = block * block_len
+        lat = lon = 0
+        name = b""
+        while cursor.at < end:
+            lat += unzigzag(cursor.varint())
+            lon += unzigzag(cursor.varint())
+            origin = cursor.u8()
+            numeric = cursor.varint()
+            kind = cursor.u8()
+            locality, area, country, street = (strings[cursor.varint()] for _ in range(4))
+            shared = cursor.varint()
+            length = cursor.varint()
+            name = name[:shared] + records[cursor.at : cursor.at + length]
+            cursor.skip(length)
+            out.write(
+                "\t".join(
+                    [
+                        str(row),
+                        f"{ORIGINS.get(origin, 'd')}{numeric}",
+                        VENUE_KINDS[kind - 1] if 0 < kind <= len(VENUE_KINDS) else "",
+                        f"{lat / 1e7:.7f}",
+                        f"{lon / 1e7:.7f}",
+                        clean(name.decode("utf-8")),
+                        clean(street),
+                        clean(locality),
+                        clean(area),
+                        clean(country),
+                        "yes" if row in listed else "no",
+                        clean(websites.get(row, "")),
+                    ]
+                )
+                + "\n"
+            )
+            row += 1
+        if cursor.at != end:
+            raise SystemExit("a record ran past the end of its block")
+    if row != header["venue_count"]:
+        raise SystemExit(f"listed {row} venues, the header says {header['venue_count']}")
+
+
+def unzigzag(value: int) -> int:
+    return (value >> 1) ^ -(value & 1)
+
+
 def summarize(data: bytes) -> dict[str, int]:
     if data[:4] == TRVP_MAGIC:
         return walk_trvp(data)
@@ -405,9 +563,16 @@ def summarize(data: bytes) -> dict[str, int]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("index", type=Path)
     parser.add_argument("--json", action="store_true", help="machine readable")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="print every venue as a tab separated row instead of counts",
+    )
     parser.add_argument(
         "--no-hash",
         action="store_true",
@@ -416,6 +581,11 @@ def main() -> None:
     args = parser.parse_args()
 
     data = args.index.read_bytes()
+    if args.list:
+        if data[:4] != TRVP_MAGIC:
+            raise SystemExit("--list reads the venue pack the app ships, venues.vpack")
+        list_trvp(data, sys.stdout)
+        return
     summary = {"bytes": len(data)}
     if not args.no_hash:
         summary["sha256"] = hashlib.sha256(data).hexdigest()
