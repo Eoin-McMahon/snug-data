@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
-"""Reads Snug's tune index, `snug.idx`: counts and structure by default, rows
-on request.
+"""Read Snug's tune index, `snug.idx`.
 
-This is the reader that ships with the tune index in the ODbL offer at
-github.com/Eoin-McMahon/snug-data, so it has to be enough on its own for a
-recipient to get every row back out, and it needs nothing outside the Python
-standard library.
+Prints counts by default, or every row of one table with `--list`. Needs
+nothing outside the Python standard library.
 
-    python3 read_tunes.py snug.idx                  counts and structure
-    python3 read_tunes.py snug.idx --json           the same, machine readable
-    python3 read_tunes.py snug.idx --list tunes     one tab separated row per tune
-    python3 read_tunes.py snug.idx --list settings  one row per setting, ABC included
+    python3 read_tunes.py snug.idx                  counts
+    python3 read_tunes.py snug.idx --json           counts as JSON
+    python3 read_tunes.py snug.idx --list tunes     one row per tune
+    python3 read_tunes.py snug.idx --list settings  one row per setting, with its ABC
     python3 read_tunes.py snug.idx --list transitions
 
-**Inside the Snug repository, never run `--list` so that its output reaches a
-Claude session's context window.** The rows are thesession.org's material
-under its contents licence, which forbids processing it with a Large Language
-Model; see `CLAUDE.md`. Verify it by counting its output (`| wc -l`), never by
-looking at it. The default mode prints no text from the file, only numbers,
-and is safe to run anywhere.
+Rows are tab separated. The counts contain no text from the file. The rows do,
+and that text is thesession.org material under its contents licence, which
+forbids processing it with a Large Language Model.
 
-The format is `crates/snug-corpus/src/artifact.rs`'s `write_tunes`, magic
-`TRDX`. Every integer is little endian and every string is a `u32` byte length
-followed by that many bytes of UTF-8:
+Every integer is little endian. A string is a u32 byte length followed by
+that many bytes of UTF-8.
 
     magic "TRDX", u32 version
     key scheme:        u8 shape, u32 length, u8 merges
@@ -44,11 +37,7 @@ followed by that many bytes of UTF-8:
     u32 transition rows, then per row:
         u32 from tune id, u32 count, then per count: u32 to tune id, u32 times
 
-A file with bytes left over, or a version this does not know, is refused: a
-misparse here reports confident nonsense. `artifact.rs` has a test that fails
-when `TRDX_VERSION` below stops matching the version it writes.
-
-Core 1048.
+A file of another version, or with bytes left over at the end, is refused.
 """
 
 from __future__ import annotations
@@ -63,7 +52,7 @@ from pathlib import Path
 TRDX_MAGIC = b"TRDX"
 TRDX_VERSION = 14
 
-# `snug_core::tune::TuneType::ALL`, counting from one; zero is "not stated".
+# Type and difficulty codes count from one. Zero means not stated.
 TUNE_TYPES = [
     "reel",
     "jig",
@@ -80,12 +69,9 @@ TUNE_TYPES = [
     "highland",
 ]
 
-# `snug_corpus::difficulty::Difficulty::ALL`, counting from one; zero is
-# "not rated".
 DIFFICULTIES = ["straightforward", "middling", "stretch", "handful"]
 
-# `snug_corpus::key::KeyShape`'s codes. Above 16 is a pitch line keyed every
-# `code - 16` steps.
+# A shape above 16 is a pitch line keyed every `shape - 16` steps.
 KEY_SHAPES = {1: "exact intervals", 2: "folded intervals", 3: "contour"}
 LINE_CODE = 16
 
@@ -126,7 +112,6 @@ class Cursor:
         return value
 
     def string_len(self) -> int:
-        """Steps over a string, returning its length and nothing of it."""
         length = self.u32()
         self.skip(length)
         return length
@@ -163,7 +148,7 @@ def open_index(blob: bytes) -> tuple[Cursor, dict]:
 
 
 def tune_rows(cursor: Cursor, want_text: bool):
-    """Yields each tune row. With `want_text` false no string is decoded."""
+    """Without `want_text`, each string is skipped and its byte length stands in for it."""
     for position in range(cursor.u32()):
         tune_id = cursor.u32()
         tunebooks = cursor.u32()
@@ -320,7 +305,6 @@ def summarize(blob: bytes) -> dict:
 
 
 def clean(text: str) -> str:
-    """One field of a tab separated row: tabs and newlines would split it."""
     return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
 
 

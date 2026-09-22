@@ -1,43 +1,25 @@
 #!/usr/bin/env python3
-"""Reads Snug's venue database: counts and structure by default, rows on
-request.
+"""Read Snug's venue database, `venues.vpack`.
 
-This is the reader that ships with the venue database in the ODbL offer at
-github.com/Eoin-McMahon/snug-data, beside `read_tunes.py` for the tune index.
-A recipient runs it to check the download and to get every venue back out:
+Prints counts by default, or every venue with `--list`.
 
-    python3 read_venues.py venues.vpack            counts and structure
-    python3 read_venues.py venues.vpack --json     the same, machine readable
+    python3 read_venues.py venues.vpack            counts
+    python3 read_venues.py venues.vpack --json     counts as JSON
     python3 read_venues.py venues.vpack --list     one tab separated row per venue
 
-The counts mode prints no text out of the file, only numbers. The rows are
-OpenStreetMap places and one yes or no per venue for whether thesession.org
-lists a session there; no text from thesession's dump is in the file.
+The venues are OpenStreetMap places. The only thing taken from thesession.org
+is a yes or no per venue for whether it lists a session there.
 
-Reads either of the two formats `crates/snug-corpus` writes, chosen by the
-file's own magic bytes:
+The file is `TRVP`: a fixed header, then blocks compressed with zstd, most of
+them against a dictionary stored in the file. Python has no zstd module before
+3.14, so this calls the `zstd` command line tool. The record blocks sit next to
+each other in the file, and zstd decodes concatenated frames in order, so all
+of them go through one `zstd -d -D <dictionary>` call.
 
-- `TRVP`, `crates/snug-corpus/src/venue_pack.rs`. What the app bundles and
-  what the ODbL offer publishes, since core 829. Block-compressed against a
-  shared zstd dictionary, so this script shells out to the `zstd` command line
-  tool to decompress; there is no zstd module in the Python standard library
-  before 3.14. `zstd -d` on a bare frame handles the string table and the
-  website block, which carry no dictionary; the record blocks are one `zstd -d
-  -D <dictionary>` over every block's compressed bytes concatenated, which
-  works because they sit contiguous in the file and zstd decodes concatenated
-  frames in sequence, so this is one process rather than thousands.
-- `TRDV`, `crates/snug-corpus/src/artifact.rs`. The flat format `snug
-  build-index --venues-out` still writes to `data/index/venues.idx`, kept
-  readable here because it is still a real, still-used file: a comparison
-  target for checking a pack was built from the same rows, and the only format
-  this script needed to read before core 829. It is a build intermediate now,
-  not what the app ships or what the offer publishes.
+The counts mode also reads `TRDV`, the flat, uncompressed format Snug's build
+writes before packing.
 
-Both are version locked: meeting an unknown version stops rather than
-guesses, because a misparse here reports confident nonsense.
-
-Split from `idx_summary.py` by core 1048, when the offer began publishing the
-tune index too, each database with its own reader.
+A file of another version, or with bytes left over at the end, is refused.
 """
 
 from __future__ import annotations
@@ -71,10 +53,6 @@ TRVP_HEADER_LEN = (
     + 8 + 4  # the website blocks' shared dictionary: offset, length
 )
 
-# `venue_pack.rs`'s own constants, and the reason this file breaks when they
-# move. Version 6 to 8 was two units on one day, 5f1e6b933 paging the string
-# table and 397cbaaef adding the sixth side array, and neither moved this
-# reader. It went unnoticed for four days because nothing runs it: core 957.
 STRING_RUN = 8192
 WEBSITE_BLOCK_GROUP = 64
 
@@ -84,8 +62,6 @@ U64 = struct.Struct("<Q")
 
 
 class Cursor:
-    """A position in a blob, with just enough to walk it."""
-
     def __init__(self, blob) -> None:
         self.blob = blob
         self.at = 0
@@ -123,13 +99,11 @@ class Cursor:
             raise SystemExit("the file ends in the middle of a record")
 
     def text(self) -> int:
-        """Steps over a length prefixed string, returning its length only."""
         length = self.u32()
         self.skip(length)
         return length
 
     def varint_text(self) -> int:
-        """As `text`, but the length prefix is a varint, not a fixed `u32`."""
         length = self.varint()
         self.skip(length)
         return length
@@ -179,9 +153,6 @@ def walk_trdv(blob: memoryview) -> dict[str, int]:
 
 
 def zstd_decompress(chunk: bytes, dictionary_path: Path | None = None) -> bytes:
-    """Shells out to the `zstd` command line tool, since Python before 3.14
-    carries no zstd module. A missing binary is refused with a message naming
-    what to install rather than a bare `FileNotFoundError`."""
     if shutil.which("zstd") is None:
         raise SystemExit("zstd is not on PATH. brew install zstd")
     args = ["zstd", "-d", "-q", "-c"]
@@ -194,7 +165,7 @@ def zstd_decompress(chunk: bytes, dictionary_path: Path | None = None) -> bytes:
 
 
 def spill(chunk: bytes) -> Path:
-    """A zstd dictionary on disk, because the CLI wants a path."""
+    """Write a zstd dictionary to a temporary file, since the CLI takes a path."""
     handle = tempfile.NamedTemporaryFile(suffix=".zdict", delete=False)
     handle.write(chunk)
     handle.close()
@@ -202,14 +173,11 @@ def spill(chunk: bytes) -> Path:
 
 
 def walk_string_table(section: bytes) -> tuple[int, bytes]:
-    """The paged string table: a count, the run length, a run count, a
-    directory of run offsets, then one independently compressed run apiece.
+    """Decompress the string table.
 
-    Paged since version 7, so that opening a pack materialises no strings at
-    all and a query decompresses the one run its answer sits in. A reader that
-    decompresses the section in one pass, which is what this did until core
-    957, gets nothing: the section is not a zstd frame, it is a directory of
-    them.
+    The table is varints for the string count, the run length and the run
+    count, then run count + 1 u32 offsets bounding the runs, then the runs,
+    each its own zstd frame.
     """
     cursor = Cursor(section)
     count = cursor.varint()
@@ -230,13 +198,11 @@ def walk_string_table(section: bytes) -> tuple[int, bytes]:
 
 
 def walk_website_block(raw: bytes) -> int:
-    """One website group: entries of a delta-varint row and a length-prefixed
-    string, run to the end.
+    """Count the entries in one website group.
 
-    A group covers `WEBSITE_BLOCK_GROUP` record blocks, and it carries no count
-    of its own: the Rust walks it until the bytes run out, so a count would be
-    a second thing to keep true. Version 6 did carry one, which is why this
-    read a count and then found a quarter of a megabyte left over.
+    A group covers `WEBSITE_BLOCK_GROUP` record blocks. Each entry is a varint
+    row delta and a varint length prefixed website. There is no count: the
+    entries run to the end of the group.
     """
     cursor = Cursor(raw)
     count = 0
@@ -245,22 +211,15 @@ def walk_website_block(raw: bytes) -> int:
         cursor.varint_text()  # website
         count += 1
     if cursor.at != len(cursor.blob):
-        raise SystemExit(f"a website entry ran past the end of its group")
+        raise SystemExit("a website entry ran past the end of its group")
     return count
 
 
 def walk_record_blocks(raw: bytes, block_boundaries: list[int]) -> int:
-    """Every record block, concatenated by the caller in block order and
-    decompressed in one pass. Walks each record's fields, in the order
-    `venue_pack::encode_block` writes them, far enough to tell whether its
-    street index is the empty string (index 0, shared by every field that
-    interned nothing) without resolving any string. Returns how many carry a
-    street.
+    """Count the records that have a street.
 
-    `block_boundaries` is each block's raw length, so a record never reads
-    across a block it did not start in even though nothing here needs the
-    boundary for correctness: every field is length prefixed or fixed width,
-    so a record can only ever consume exactly its own bytes.
+    `raw` is every record block decompressed, in order, and `block_boundaries`
+    is each block's decompressed length. String index 0 is the empty string.
     """
     cursor = Cursor(raw)
     with_street = 0
@@ -287,7 +246,6 @@ def walk_record_blocks(raw: bytes, block_boundaries: list[int]) -> int:
 
 
 def trvp_header(blob: bytes) -> dict:
-    """The fixed header, in the order `venue_pack.rs` writes it."""
     if len(blob) < TRVP_HEADER_LEN or blob[:4] != TRVP_MAGIC:
         raise SystemExit("not a snug venue pack")
     cursor = Cursor(blob)
@@ -324,11 +282,11 @@ def trvp_header(blob: bytes) -> dict:
 
 
 def trvp_blocks(blob: bytes, header: dict) -> list[tuple[int, int, int]]:
-    """Each record block's offset, compressed length and raw length."""
+    """Return each record block's offset, compressed length and raw length."""
     entries = []
     at = header["block_index_offset"]
     for _ in range(header["block_count"]):
-        # first_morton (u8; 8), offset (u8; 8), compressed_len (u32), raw_len (u32)
+        # u64 first Morton code, u64 offset, u32 compressed length, u32 raw length
         _first_morton, offset, compressed_len, raw_len = struct.unpack_from("<QQII", blob, at)
         entries.append((offset, compressed_len, raw_len))
         at += 24
@@ -403,7 +361,7 @@ def walk_trvp(blob: bytes) -> dict[str, int]:
         if dictionary_path is not None:
             dictionary_path.unlink(missing_ok=True)
 
-    listed_offset, listed_len = side["listed"]
+    _, listed_len = side["listed"]
     if listed_len % 4 != 0:
         raise SystemExit("the listed rows array is not a whole number of u32 rows")
     holding_sessions = listed_len // 4
@@ -434,7 +392,6 @@ ORIGINS = {0: "n", 1: "w", 2: "r"}
 
 
 def clean(text: str) -> str:
-    """One field of a tab separated row: tabs and newlines would split it."""
     return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
 
 
@@ -446,11 +403,11 @@ def varint_string(raw: bytes, cursor: Cursor) -> str:
 
 
 def list_trvp(blob: bytes, out) -> None:
-    """Every venue as one tab separated row, in the pack's own row order.
+    """Write every venue as one tab separated row, in the file's row order.
 
-    Decodes what `walk_trvp` steps over: the string table, each record's
-    coordinate deltas and prefix-shared name, the website groups and the
-    listed rows. Coordinates are stored as degrees times ten million.
+    Coordinates are stored as zigzag varint deltas of degrees times ten
+    million. A name is stored as the length it shares with the previous name
+    in its block, then the rest of it.
     """
     header = trvp_header(blob)
     block_len = header["block_len"]
