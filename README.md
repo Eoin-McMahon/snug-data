@@ -8,10 +8,16 @@ The app carries two databases derived from ODbL sources, and each is
 published here as its own release, in the same bytes the app carries, with its
 own reader and its own README:
 
-| Release | File | Derived from | Reader |
-|---|---|---|---|
-| `tunes-<date>` | `snug.idx.gz`, the tune index | thesession.org's dump | `read_tunes.py` |
-| `venues-<date>` | `venues.vpack.gz`, the venue database | OpenStreetMap, and thesession.org's session listings | `read_venues.py` |
+| Database | Download | Reader |
+|---|---|---|
+| The tune index, derived from thesession.org's dump | [`snug.idx.gz`](https://github.com/Eoin-McMahon/snug-data/releases/download/tunes-2026-09-09/snug.idx.gz), release `tunes-2026-09-09` | `read_tunes.py` |
+| The venue database, derived from OpenStreetMap and thesession.org's session listings | [`venues.vpack.gz`](https://github.com/Eoin-McMahon/snug-data/releases/download/venues-2026-09-09/venues.vpack.gz), release `venues-2026-09-09` | `read_venues.py` |
+
+**The databases are release files, not files in this repository**, because
+each is over GitHub's 100 MB limit for a file in a repository. The readers sit
+here beside this README. thesession.org's session listings are inside the
+venue database, as a yes or no per venue for whether a session is listed
+there, which is what the app's map draws; `read_venues.py` counts them.
 
 The date is the day the database was built. They are on the
 [releases page](https://github.com/Eoin-McMahon/snug-data/releases), and an
